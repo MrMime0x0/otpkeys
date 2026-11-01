@@ -1,0 +1,696 @@
+// ===== FIXED SETTINGS (everything else is changed with: otpkeys set) =====
+KEYFILE = home_dir + "/keys.dat"
+LOGFILE = home_dir + "/audit.log"
+SHARD_DIRS = [home_dir + "/a", home_dir + "/b", home_dir + "/c"]
+SHARD_NAMES = ["shard1.dat", "shard2.dat", "shard3.dat"]
+// =========================================================================
+
+DEFAULTS = {"user":"guest","ttl":30,"idle":10,"shelf":1440,"uses":1,"strikes":3,"pinTries":3,"lockHits":6,"low":3,"logfile":"/var/system.log","login":"guest","fail":"failed","lockdown":0,"bad":0,"hits":0}
+HIDDEN = ["lockdown","bad","hits"]
+
+hex = "0123456789abcdef"
+pc = get_shell.host_computer
+S = null
+
+// ---------- safe helpers (split() is regex in Greyscript) ----------
+splitOn = function(s, d)
+  out = []
+  while true
+    i = s.indexOf(d)
+    if i == null then break
+    out.push(s[:i])
+    s = s[i + d.len:]
+  end while
+  out.push(s)
+  return out
+end function
+
+tail = function(lines, n)
+  if lines.len <= n then return lines
+  return lines[lines.len - n:]
+end function
+
+// ---------- clock ----------
+nowMin = function()
+  nums = []
+  cur = ""
+  for ch in current_date
+    if ch >= "0" and ch <= "9" then
+      cur = cur + ch
+    else
+      if cur != "" then nums.push(cur.val)
+      cur = ""
+    end if
+  end for
+  if cur != "" then nums.push(cur.val)
+  if nums.len < 5 then return floor(time / 60)
+  cum = [0,31,59,90,120,151,181,212,243,273,304,334]
+  // assumes order: day, month, year, hour, minute
+  days = nums[2] * 365 + cum[(nums[1] - 1) % 12] + nums[0]
+  return days * 1440 + nums[3] * 60 + nums[4]
+end function
+
+// ---------- crypto helpers ----------
+toHex = function(n)
+  return hex[floor(n / 16)] + hex[n % 16]
+end function
+
+bytesToHex = function(list)
+  s = ""
+  for b in list
+    s = s + toHex(b)
+  end for
+  return s
+end function
+
+hexToBytes = function(h)
+  list = []
+  if h.len < 2 then return list
+  for i in range(0, floor(h.len / 2) - 1)
+    list.push(hex.indexOf(h[i*2]) * 16 + hex.indexOf(h[i*2+1]))
+  end for
+  return list
+end function
+
+randBytes = function(n)
+  list = []
+  for i in range(1, n)
+    list.push(floor(rnd * 256))
+  end for
+  return list
+end function
+
+xor = function(a, b)
+  return bitwise("^", a, b)
+end function
+
+enc = function(text, keyBytes)
+  s = ""
+  if text.len == 0 then return s
+  for i in range(0, text.len - 1)
+    s = s + toHex(xor(text[i].code, keyBytes[i % keyBytes.len]))
+  end for
+  return s
+end function
+
+dec = function(h, keyBytes)
+  data = hexToBytes(h)
+  s = ""
+  if data.len == 0 then return s
+  for i in range(0, data.len - 1)
+    s = s + char(xor(data[i], keyBytes[i % keyBytes.len]))
+  end for
+  return s
+end function
+
+// simple checksum/hash (fine for a game, not real-world crypto)
+hash = function(s)
+  h = 5381
+  for ch in s
+    h = (h * 33 + ch.code) % 4294967296
+  end for
+  return h
+end function
+
+pinSalt = function(p)
+  return "otp:" + p + ":" + p.len
+end function
+
+// ---------- files ----------
+fileExists = function(path)
+  return pc.File(path) != null
+end function
+
+writeFile = function(folder, name, content)
+  if pc.File(folder) == null then
+    cut = folder.lastIndexOf("/")
+    parent = folder[:cut]
+    if parent == "" then parent = "/"
+    pc.create_folder(parent, folder[cut + 1:])
+  end if
+  if pc.File(folder + "/" + name) == null then pc.touch(folder, name)
+  pc.File(folder + "/" + name).set_content(content)
+end function
+
+readFile = function(path)
+  f = pc.File(path)
+  if f == null then exit("Missing file: " + path)
+  return f.get_content
+end function
+
+// ---------- audit log (last 200 lines) ----------
+audit = function(msg)
+  old = ""
+  if fileExists(LOGFILE) then
+    old = pc.File(LOGFILE).get_content
+  else
+    pc.touch(home_dir, "audit.log")
+  end if
+  lines = []
+  if old != "" then lines = old.split(char(10))
+  lines.push(current_date + "  " + msg)
+  lines = tail(lines, 200)
+  pc.File(LOGFILE).set_content(lines.join(char(10)))
+end function
+
+// ---------- shards: M = A ^ B ^ C ----------
+makeShards = function()
+  master = randBytes(16)
+  a = randBytes(16)
+  b = randBytes(16)
+  c = []
+  for i in range(0, 15)
+    c.push(xor(xor(master[i], a[i]), b[i]))
+  end for
+  writeFile(SHARD_DIRS[0], SHARD_NAMES[0], bytesToHex(a))
+  writeFile(SHARD_DIRS[1], SHARD_NAMES[1], bytesToHex(b))
+  writeFile(SHARD_DIRS[2], SHARD_NAMES[2], bytesToHex(c))
+  return master
+end function
+
+readMaster = function()
+  parts = []
+  for i in range(0, 2)
+    p = SHARD_DIRS[i] + "/" + SHARD_NAMES[i]
+    if not fileExists(p) then exit("Shard " + (i + 1) + " is missing: " + p)
+    bytes = hexToBytes(readFile(p))
+    if bytes.len != 16 then exit("Shard " + (i + 1) + " is damaged: " + p)
+    parts.push(bytes)
+  end for
+  master = []
+  for i in range(0, 15)
+    master.push(xor(xor(parts[0][i], parts[1][i]), parts[2][i]))
+  end for
+  return master
+end function
+
+// ---------- settings stored inside the encrypted file ----------
+cfgString = function(c)
+  parts = []
+  for kv in c
+    parts.push(kv.key + "=" + kv.value)
+  end for
+  return parts.join(";")
+end function
+
+parseCfg = function(s)
+  c = {} + DEFAULTS
+  if s != "" then
+    for pair in splitOn(s, ";")
+      i = pair.indexOf("=")
+      if i != null then
+        k = pair[:i]
+        v = pair[i + 1:]
+        if DEFAULTS.hasIndex(k) then
+          if DEFAULTS[k] isa number then c[k] = v.val else c[k] = v
+        end if
+      end if
+    end for
+  end if
+  return c
+end function
+
+// ---------- keys ----------
+randKey = function()
+  chars = "abcdefghjkmnpqrstuvwxyz23456789"
+  k = ""
+  for i in range(1, 10)
+    if i == 6 then k = k + "-"
+    k = k + chars[floor(rnd * chars.len)]
+  end for
+  return k
+end function
+
+newEntry = function(t)
+  return {"k": randKey, "issued": t, "act": 0, "uses": 0, "strikes": 0}
+end function
+
+serialize = function(list)
+  parts = []
+  for e in list
+    parts.push(e.k + ":" + e.issued + ":" + e.act + ":" + e.uses + ":" + e.strikes)
+  end for
+  return parts.join(",")
+end function
+
+parse = function(body)
+  list = []
+  if body == "" then return list
+  for p in splitOn(body, ",")
+    f = splitOn(p, ":")
+    if f.len >= 5 then
+      list.push({"k": f[0], "issued": f[1].val, "act": f[2].val, "uses": f[3].val, "strikes": f[4].val})
+    end if
+  end for
+  return list
+end function
+
+// ---------- save / load (checksum detects tampering) ----------
+save = function()
+  master = makeShards
+  body = S.pin + "|" + cfgString(S.cfg) + "|" + serialize(S.keys)
+  text = "OTP:" + hash(body) + "|" + body
+  if not fileExists(KEYFILE) then pc.touch(home_dir, "keys.dat")
+  pc.File(KEYFILE).set_content(enc(text, master))
+end function
+
+loadState = function()
+  text = dec(readFile(KEYFILE), readMaster)
+  if text[:4] != "OTP:" then exit("Shards wrong, missing, or file replaced. Access denied.")
+  rest = text[4:]
+  i = rest.indexOf("|")
+  if i == null then exit("Key file corrupted. Delete keys.dat and shards, then run: otpkeys setup")
+  body = rest[i + 1:]
+  if hash(body) != rest[:i].val then exit("Key file was modified. Run: otpkeys doctor")
+  p = splitOn(body, "|")
+  while p.len < 3
+    p.push("")
+  end while
+  return {"pin": p[0].val, "cfg": parseCfg(p[1]), "keys": parse(p[2])}
+end function
+
+// ---------- THE EXPIRY ALGORITHM ----------
+ttlFor = function(e)
+  t = floor(S.cfg.ttl / (1 + e.strikes))
+  if t < 3 then t = 3
+  return t
+end function
+
+expiredReason = function(e, t)
+  c = S.cfg
+  if e.uses >= c.uses then return "used"
+  if e.strikes >= c.strikes then return "strikes"
+  if e.act > 0 then
+    age = t - e.act
+    if age > ttlFor(e) then return "ttl"
+    if e.uses == 0 and age > c.idle then return "idle"
+  else
+    if t - e.issued > c.shelf then return "stale"
+  end if
+  return ""
+end function
+
+lifeLeft = function(e, t)
+  left = ttlFor(e) - (t - e.act)
+  if e.uses == 0 then
+    idleLeft = S.cfg.idle - (t - e.act)
+    if idleLeft < left then left = idleLeft
+  end if
+  return left
+end function
+
+sweep = function(list, t)
+  changed = false
+  out = []
+  for e in list
+    r = expiredReason(e, t)
+    if r != "" then
+      audit("burned: " + r + " (uses " + e.uses + ", strikes " + e.strikes + ")")
+      changed = true
+    else
+      out.push(e)
+    end if
+  end for
+  if out.len > 0 and out[0].act == 0 then
+    out[0].act = t
+    changed = true
+  end if
+  return {"list": out, "changed": changed}
+end function
+
+applyHead = function()
+  if S.keys.len > 0 then
+    pc.change_password(S.cfg.user, S.keys[0].k)
+  else
+    pc.change_password(S.cfg.user, bytesToHex(randBytes(12)))
+  end if
+end function
+
+tick = function()
+  if S.cfg.lockdown == 1 then return
+  r = sweep(S.keys, nowMin)
+  S.keys = r.list
+  if r.changed then
+    applyHead
+    save
+  end if
+end function
+
+// ---------- security ----------
+doLockdown = function(reason)
+  S.cfg.lockdown = 1
+  pc.change_password(S.cfg.user, bytesToHex(randBytes(12)))
+  audit("LOCKDOWN: " + reason)
+  save
+  print("LOCKDOWN: account locked. Run 'otpkeys open' (needs PIN) to lift it.")
+end function
+
+auth = function(allowLocked = false)
+  if S.cfg.lockdown == 1 and not allowLocked then exit("LOCKDOWN active. Run: otpkeys open")
+  pin = user_input("PIN: ", true)
+  if hash(pinSalt(pin)) == S.pin then
+    if S.cfg.bad > 0 then
+      S.cfg.bad = 0
+      save
+    end if
+    return true
+  end if
+  S.cfg.bad = S.cfg.bad + 1
+  audit("wrong PIN (" + S.cfg.bad + "/" + S.cfg.pinTries + ")")
+  if S.cfg.bad >= S.cfg.pinTries then
+    doLockdown("too many wrong PINs")
+  else
+    save
+  end if
+  exit("Wrong PIN.")
+end function
+
+askNewPin = function()
+  a = user_input("Choose admin PIN (4+ chars): ", true)
+  if a.len < 4 then exit("PIN too short.")
+  b = user_input("Repeat PIN: ", true)
+  if a != b then exit("PINs don't match.")
+  return hash(pinSalt(a))
+end function
+
+// ---------- ease of use ----------
+reveal = function(title, entries)
+  print(title)
+  if entries.len > 0 then
+    for i in range(0, entries.len - 1)
+      print("  " + (i + 1) + ": " + entries[i].k)
+    end for
+  end if
+  user_input("Write them down, then press Enter to clear the screen...")
+  clear_screen
+end function
+
+shardReport = function()
+  missing = 0
+  for i in range(0, 2)
+    p = SHARD_DIRS[i] + "/" + SHARD_NAMES[i]
+    if fileExists(p) then
+      print("  OK       " + p)
+    else
+      print("  MISSING  " + p)
+      missing = missing + 1
+    end if
+  end for
+  return missing
+end function
+
+showHelp = function()
+  print("FIRST TIME")
+  print("  setup              wizard: PIN + first keys")
+  print("DAILY")
+  print("  watch (w)          auto-rotate on login, failures, and time")
+  print("  status (s)         shards, queue, time left (keys masked)")
+  print("  now                show active key, then clear screen  [PIN]")
+  print("  next (n)           force-rotate to next key            [PIN]")
+  print("  add [n]            add n keys (default 10)             [PIN]")
+  print("  extend [m]         give active key m more minutes      [PIN]")
+  print("  gen (g) [n]        replace all keys with n new ones    [PIN]")
+  print("SECURITY")
+  print("  lockdown (l)       lock the account instantly")
+  print("  open               lift lockdown                       [PIN]")
+  print("  pin                change PIN                          [PIN]")
+  print("  history [n]        last n audit entries")
+  print("  panic              wipe keys and shards                [PIN]")
+  print("TUNING")
+  print("  set                list settings / set <name> <value>  [PIN]")
+  print("  learn              show recent log lines to pick login/fail text")
+  print("  doctor             check that everything is healthy")
+end function
+
+// =================== COMMANDS ===================
+cmd = ""
+if params.len > 0 then cmd = params[0]
+alias = {"g":"gen","n":"next","s":"status","w":"watch","h":"help","d":"doctor","l":"lockdown"}
+if alias.hasIndex(cmd) then cmd = alias[cmd]
+
+if cmd == "" or cmd == "help" then
+  showHelp
+
+else if cmd == "setup" then
+  if fileExists(KEYFILE) then exit("Already set up. Use: otpkeys gen")
+  pinH = askNewPin
+  nIn = user_input("How many keys? (default 20): ")
+  n = 20
+  if nIn != "" then n = nIn.val
+  if n < 1 then n = 20
+  t = nowMin
+  S = {"pin": pinH, "cfg": {} + DEFAULTS, "keys": []}
+  for i in range(1, n)
+    S.keys.push(newEntry(t))
+  end for
+  S.keys[0].act = t
+  save
+  applyHead
+  audit("setup, " + n + " keys")
+  reveal("Your one-time keys:", S.keys)
+  print("Done. Next: otpkeys doctor, then otpkeys watch")
+
+else if cmd == "doctor" then
+  print("Shards:")
+  missing = shardReport
+  print("Clock: '" + current_date + "' parsed as minute " + nowMin)
+  print("  (log in twice a few minutes apart and check this number rises by the right amount)")
+  if missing > 0 then exit("Fix the missing shards first.")
+  if not fileExists(KEYFILE) then exit("No key file. Run: otpkeys setup")
+  S = loadState
+  print("Key file: OK, " + S.keys.len + " keys, checksum valid")
+  if fileExists(S.cfg.logfile) then
+    print("Log file: OK (" + S.cfg.logfile + ")")
+  else
+    print("Log file: NOT FOUND (" + S.cfg.logfile + "). Fix: otpkeys set logfile <path>")
+  end if
+  if S.cfg.lockdown == 1 then print("LOCKDOWN is active.")
+  if S.keys.len <= S.cfg.low then print("WARNING: only " + S.keys.len + " keys left. Run: otpkeys add")
+
+else
+  if not fileExists(KEYFILE) then exit("Not set up yet. Run: otpkeys setup")
+  S = loadState
+
+  if cmd == "gen" then
+    auth
+    if S.keys.len > 0 then
+      ok = user_input("This replaces " + S.keys.len + " unused keys. Continue? (y/n): ")
+      if ok != "y" then exit("Cancelled.")
+    end if
+    n = 20
+    if params.len > 1 then n = params[1].val
+    if n < 1 then n = 20
+    t = nowMin
+    S.keys = []
+    for i in range(1, n)
+      S.keys.push(newEntry(t))
+    end for
+    S.keys[0].act = t
+    S.cfg.hits = 0
+    save
+    applyHead
+    audit("gen " + n + " keys")
+    reveal(n + " new one-time keys:", S.keys)
+
+  else if cmd == "add" then
+    auth
+    n = 10
+    if params.len > 1 then n = params[1].val
+    if n < 1 then n = 10
+    t = nowMin
+    fresh = []
+    for i in range(1, n)
+      fresh.push(newEntry(t))
+    end for
+    S.keys = S.keys + fresh
+    save
+    tick
+    audit("added " + n + " keys")
+    reveal("Added " + n + " keys:", fresh)
+
+  else if cmd == "now" then
+    auth
+    tick
+    if S.keys.len == 0 then exit("No keys left.")
+    e = S.keys[0]
+    print("Active key: " + e.k)
+    print(lifeLeft(e, nowMin) + " min left, uses " + e.uses + "/" + S.cfg.uses + ", strikes " + e.strikes + "/" + S.cfg.strikes)
+    user_input("Press Enter to clear the screen...")
+    clear_screen
+
+  else if cmd == "next" then
+    auth
+    if S.keys.len == 0 then exit("No keys left.")
+    S.keys[0].uses = S.cfg.uses
+    tick
+    print("Rotated. " + S.keys.len + " keys left.")
+
+  else if cmd == "extend" then
+    auth
+    mins = 10
+    if params.len > 1 then mins = params[1].val
+    if S.keys.len == 0 then exit("No keys left.")
+    S.keys[0].act = S.keys[0].act + mins
+    save
+    audit("extended active key by " + mins + " min")
+    print("Extended by " + mins + " min.")
+
+  else if cmd == "status" then
+    print("Shards:")
+    shardReport
+    tick
+    t = nowMin
+    if S.cfg.lockdown == 1 then print("*** LOCKDOWN ACTIVE ***")
+    print("Keys left: " + S.keys.len)
+    if S.keys.len <= S.cfg.low then print("WARNING: running low. Run: otpkeys add")
+    if S.keys.len > 0 then
+      for i in range(0, S.keys.len - 1)
+        e = S.keys[i]
+        if i == 0 then
+          print("  ACTIVE  " + e.k[:2] + "***  " + lifeLeft(e, t) + " min left, uses " + e.uses + "/" + S.cfg.uses + ", strikes " + e.strikes)
+        else
+          print("  queued  " + e.k[:2] + "***  stale in " + (S.cfg.shelf - (t - e.issued)) + " min")
+        end if
+      end for
+    end if
+
+  else if cmd == "lockdown" then
+    doLockdown("manual")
+
+  else if cmd == "open" then
+    auth(true)
+    S.cfg.lockdown = 0
+    S.cfg.hits = 0
+    S.cfg.bad = 0
+    if S.keys.len > 0 then S.keys[0].act = nowMin
+    applyHead
+    save
+    audit("lockdown lifted")
+    print("Lockdown lifted. " + S.keys.len + " keys available.")
+    if S.keys.len == 0 then print("No keys left. Run: otpkeys gen")
+
+  else if cmd == "pin" then
+    auth
+    S.pin = askNewPin
+    save
+    audit("PIN changed")
+    print("PIN changed.")
+
+  else if cmd == "set" then
+    auth
+    if params.len < 3 then
+      for kv in S.cfg
+        if HIDDEN.indexOf(kv.key) == null then print("  " + kv.key + " = " + kv.value)
+      end for
+      print("Usage: otpkeys set <name> <value>")
+    else
+      name = params[1]
+      newVal = params[2:].join(" ")
+      if not DEFAULTS.hasIndex(name) or HIDDEN.indexOf(name) != null then exit("Unknown setting: " + name)
+      if newVal.indexOf("|") != null or newVal.indexOf(";") != null then exit("Value can't contain | or ;")
+      if DEFAULTS[name] isa number then
+        num = newVal.val
+        if str(num) != newVal then exit(name + " needs a number.")
+        S.cfg[name] = num
+      else
+        S.cfg[name] = newVal
+      end if
+      save
+      audit("setting changed: " + name + " = " + newVal)
+      print(name + " = " + newVal)
+      if name == "user" then print("Note: the old account keeps its last password. Lock it down by hand.")
+    end if
+
+  else if cmd == "learn" then
+    lf = pc.File(S.cfg.logfile)
+    if lf == null then exit("Log not found: " + S.cfg.logfile + "  (otpkeys set logfile <path>)")
+    lines = tail(lf.get_content.split(char(10)), 8)
+    print("Last log lines:")
+    print(lines.join(char(10)))
+    print("")
+    print("Log in once (and fail once), run this again, then:")
+    print("  otpkeys set login <text only in a good login line>")
+    print("  otpkeys set fail <text only in a failed attempt>")
+
+  else if cmd == "history" then
+    n = 15
+    if params.len > 1 then n = params[1].val
+    if not fileExists(LOGFILE) then exit("No history yet.")
+    lines = tail(pc.File(LOGFILE).get_content.split(char(10)), n)
+    print(lines.join(char(10)))
+
+  else if cmd == "watch" then
+    auth
+    print("Watching " + S.cfg.logfile + ". Ctrl+C to stop.")
+    lf = pc.File(S.cfg.logfile)
+    if lf == null then exit("Log not found. Run: otpkeys learn")
+    lastLen = lf.get_content.split(char(10)).len
+    warned = false
+    while true
+      wait(3)
+      S = loadState
+      if S.cfg.lockdown == 1 then exit("Lockdown active. Watch stopped.")
+      lf = pc.File(S.cfg.logfile)
+      if lf != null then
+        lines = lf.get_content.split(char(10))
+        if lines.len < lastLen then lastLen = 0
+        if lines.len > lastLen then
+          fresh = lines[lastLen:]
+          lastLen = lines.len
+          dirty = false
+          for ln in fresh
+            if S.keys.len > 0 then
+              low = ln.lower
+              if low.indexOf(S.cfg.fail.lower) != null then
+                S.keys[0].strikes = S.keys[0].strikes + 1
+                S.cfg.hits = S.cfg.hits + 1
+                audit("strike: " + ln[:80])
+                print("Strike " + S.keys[0].strikes + "/" + S.cfg.strikes)
+                dirty = true
+              else if low.indexOf(S.cfg.login.lower) != null then
+                S.keys[0].uses = S.keys[0].uses + 1
+                S.cfg.hits = 0
+                audit("login: " + ln[:80])
+                print("Login detected.")
+                dirty = true
+              end if
+            end if
+          end for
+          if dirty then
+            save
+            if S.cfg.hits >= S.cfg.lockHits then
+              doLockdown("brute force (" + S.cfg.hits + " failures in a row)")
+              exit("Watch stopped.")
+            end if
+          end if
+        end if
+      end if
+      tick
+      if S.keys.len == 0 then exit("Out of keys. Account locked. Run: otpkeys gen")
+      if S.keys.len <= S.cfg.low and not warned then
+        print("WARNING: only " + S.keys.len + " keys left.")
+        warned = true
+      end if
+      if S.keys.len > S.cfg.low then warned = false
+    end while
+
+  else if cmd == "panic" then
+    auth(true)
+    yes = user_input("Wipe all keys and shards? (type YES): ")
+    if yes == "YES" then
+      pc.change_password(S.cfg.user, bytesToHex(randBytes(12)))
+      audit("PANIC: wiped")
+      pc.File(KEYFILE).delete
+      for i in range(0, 2)
+        p = SHARD_DIRS[i] + "/" + SHARD_NAMES[i]
+        if fileExists(p) then pc.File(p).delete
+      end for
+      print("Wiped. Account locked.")
+    else
+      print("Cancelled.")
+    end if
+
+  else
+    print("Unknown command. Try: otpkeys help")
+  end if
+end if
